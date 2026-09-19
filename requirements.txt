@@ -1,0 +1,189 @@
+import streamlit as st
+import json
+import urllib.request
+import time
+import os
+import re
+import pandas as pd
+import subprocess
+
+def call_ollama(model, prompt, system_prompt):
+    url = "http://localhost:11434/api/generate"
+    data = {
+        "model": model, 
+        "prompt": prompt, 
+        "system": system_prompt, 
+        "stream": False, 
+        "options": {"temperature": 0.1, "num_ctx": 4048}
+    }
+    req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req) as r:
+            return json.loads(r.read().decode('utf-8')).get('response', '')
+    except Exception as e: 
+        return f"error: {e}"
+
+FALLBACK_CALCULATOR_CODE = """import sys
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QLineEdit, QGridLayout
+from PyQt5.QtGui import QFont
+
+class Calculator(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+    def initUI(self):
+        layout = QVBoxLayout()
+        self.textbox = QLineEdit(self)
+        self.textbox.setFont(QFont('Arial', 18))
+        self.textbox.setReadOnly(True)
+        layout.addWidget(self.textbox)
+        grid = QGridLayout()
+        buttons = [['7', '8', '9', '/'], ['4', '5', '6', '*'], ['1', '2', '3', '-'], ['0', '.', '=', '+']]
+        for row, row_btns in enumerate(buttons):
+            for col, text in enumerate(row_btns):
+                btn = QPushButton(text, self)
+                btn.setFont(QFont('Arial', 12))
+                if text == '=': btn.clicked.connect(self.calculate)
+                else: btn.clicked.connect(self.on_click)
+                grid.addWidget(btn, row, col)
+        btn_c = QPushButton('C', self)
+        btn_c.setFont(QFont('Arial', 12))
+        btn_c.clicked.connect(self.textbox.clear)
+        grid.addWidget(btn_c, 4, 0, 1, 2)
+        btn_bs = QPushButton('BS', self)
+        btn_bs.setFont(QFont('Arial', 12))
+        btn_bs.clicked.connect(self.on_backspace)
+        grid.addWidget(btn_bs, 4, 2, 1, 2)
+        layout.addLayout(grid)
+        self.setLayout(layout)
+        self.setWindowTitle('lingish 완벽 계산기')
+        self.setGeometry(300, 300, 300, 350)
+    def on_click(self):
+        self.textbox.setText(self.textbox.text() + self.sender().text())
+    def calculate(self):
+        try: self.textbox.setText(str(eval(self.textbox.text())))
+        except: self.textbox.setText("Error")
+    def on_backspace(self):
+        self.textbox.setText(self.textbox.text()[:-1])
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    calc = Calculator()
+    calc.show()
+    sys.exit(app.exec_())
+"""
+
+st.set_page_config(page_title="lingish flow v7", layout="wide")
+st.title("🦙 lingish flow (자율 위임 로컬 샌드박스)")
+st.caption("AI 포기 차단 및 하드웨어 매핑 가변 프로젝트명 엔진 자동 연동 하네스")
+
+AGENTS = {
+    'Manager': {'model': 'qwen2.5:7b', 'system': '당신은 프로젝트 관리자입니다. 요구사항 분석 후 개발 기획안을 작성하세요. 마지막 줄에 [다음위임: Coder1]을 출력하세요.'},
+    'Coder1': {'model': 'qwen2.5-coder:3b', 'system': '당신은 개발자입니다. 코드는 반드시 ```python ... ``` 안에 작성하고, 마지막 줄에 [다음위임: Coder2]를 출력하세요.'},
+    'Coder2': {'model': 'codegemma:2b', 'system': '당신은 코드 검수자입니다. 코드에 오류가 있으면 마지막 줄에 [다음위임: Coder1]을 출력하고 피드백을 주세요. 완벽하면 [다음위임: Tester]를 출력하세요.'},
+    'Tester': {'model': 'qwen2.5:3b', 'system': '당신은 QA 에이전트입니다. 로그에 조금의 Error 문구라도 보이면 실패로 간주하고 [다음위임: Coder1]을, 완벽 성공 시 [다음위임: Writer]를 마지막 줄에 명시하세요.'},
+    'Writer': {'model': 'qwen2.5:3b', 'system': '당신은 문서 작성자입니다. 완성된 코드를 설명하는 설명서를 한국어 마크다운으로 작성하세요. 마지막 줄에 [작업완료]를 출력하세요.'}
+}
+
+# 💡 마우스 클릭 없는 엔터 가동형 입력창 레이아웃 유지
+user_input = st.chat_input('AI 팀에게 내릴 명령을 입력한 후 엔터(Enter) 키를 치세요')
+
+project_name = "my_project"
+if user_input:
+    lower_input = user_input.lower()
+    if "계산기" in lower_input or "calc" in lower_input: project_name = "calculator"
+    elif "메모" in lower_input or "memo" in lower_input or "notepad" in lower_input: project_name = "memo_app"
+    elif "테트리스" in lower_input or "tetris" in lower_input: project_name = "tetris"
+    elif "게임" in lower_input or "game" in lower_input: project_name = "mini_game"
+    else:
+        words = re.findall(r'[a-zA-Z]+', user_input)
+        if words: project_name = words[0].lower()
+
+st.sidebar.metric(label="🎯 시스템 확정 파일명", value=f"{project_name}.py")
+
+if user_input:
+    current_agent, current_prompt, max_loops, loop_count = 'Manager', user_input, 12, 0
+    performance_log, final_code_content, final_readme_content = [], '', ''
+    st.info(f"🚀 **로컬 파이프라인 가동:** '{user_input}' 연산을 개시합니다.")
+
+    while current_agent and loop_count < max_loops:
+        loop_count += 1
+        agent_info = AGENTS[current_agent]
+        
+        with st.status(f"⏳ **{current_agent}** 연산 및 정밀 검수 중... [{loop_count}/{max_loops}]", expanded=True) as status:
+            with st.expander(f"📥 {current_agent} 브리핑 데이터", expanded=False): st.info(current_prompt)
+            
+            start_time = time.time()
+            response = call_ollama(agent_info['model'], current_prompt, agent_info['system'])
+            performance_log.append({'Agent': f'#{loop_count} {current_agent}', 'Time(s)': round(time.time() - start_time, 2)})
+            st.write(response)
+            
+            if any(word in response for word in ["죄송합니다", "고치지 못합니다", "수정할 수 없습니다", "제 한계", "오류가 발생하여"]):
+                if "calculator" in project_name:
+                    st.warning("⚠️ [AI 포기 감지] 로컬 AI가 버그 수정을 포기하여 시스템 표준 코드를 강제 수혈합니다.")
+                    final_code_content = FALLBACK_CALCULATOR_CODE
+                    current_prompt = "AI 개발팀이 포기하여 시스템 표준 코드가 주입되었습니다. 이 코드를 기반으로 가이드라인을 최종 작성하세요:\n\n" + FALLBACK_CALCULATOR_CODE
+                    current_agent = 'Writer'; continue
+
+            if current_agent in ['Coder1', 'Coder2']:
+                code_blocks = re.findall(r'```python\s*(.*?)\s*```', response, re.DOTALL)
+                if code_blocks: 
+                    final_code_content = code_blocks[-1]
+                    if "calculator" in project_name and "connect" not in final_code_content:
+                        st.error("🚨 [시스템 엔진] '.connect'가 누락된 먹통 코드를 감지했습니다! 강제 재수정 지시.")
+                        current_prompt = "버튼 클릭 이벤트 '.connect' 문법이 빠져있습니다! 전부 채워서 다시 짜오세요!"
+                        current_agent = 'Coder1'; continue
+
+            if current_agent == 'Tester' and final_code_content:
+                desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+                target_file_path = os.path.join(desktop_path, f"{project_name}.py")
+                with open(target_file_path, 'w', encoding='utf-8') as f: f.write(final_code_content)
+                
+                try: proc = subprocess.run([".\\.venv\\Scripts\\python.exe", target_file_path], capture_output=True, text=True, timeout=1.5)
+                except subprocess.TimeoutExpired as te: proc = te
+                
+                test_log_output = f"[출력]:\n{proc.stdout}\n[에러]:\n{proc.stderr}" if hasattr(proc, 'stderr') else 'Base GUI Runtime Loop Stable.'
+                with st.expander("🛠️ 터미널 실시간 구동 로그 결과", expanded=True): st.code(test_log_output)
+                
+                if any(err in test_log_output for err in ["Error", "Exception", "invalid", "ModuleNotFoundError"]):
+                    st.error("🚨 [QA 테스터] 런타임 에러 포착! Coder1에게 즉시 리턴.")
+                    current_prompt = f"파이썬 구동 결과 버그가 터졌습니다. 즉시 고치세요:\n\n{test_log_output}"
+                    current_agent = 'Coder1'; continue
+                else: response = '검증 완료: 정상 구동 확인. [다음위임: Writer]'
+
+            next_agent = None
+            if '[다음위임:' in response:
+                try: next_agent = response.split('[다음위임:').split(']').strip()
+                except: next_agent = None
+
+            if next_agent == 'Coder1' and current_agent == 'Coder2':
+                status.update(label='🔄 Coder2 ➔ Coder1 반려 피드백', state='error')
+                current_prompt = f"검수자가 수정을 요구했습니다:\n\n{response}"
+                current_agent = 'Coder1'; continue
+
+            if next_agent not in AGENTS or next_agent == current_agent:
+                fallback_map = {'Manager': 'Coder1', 'Coder1': 'Coder2', 'Coder2': 'Tester', 'Tester': 'Writer', 'Writer': None}
+                next_agent = fallback_map[current_agent]
+
+            if current_agent == 'Writer': final_readme_content = response.replace('[작업완료]', '').strip()
+
+            if next_agent in AGENTS:
+                status.update(label=f"🎯 {current_agent} ➔ {next_agent} 위임", state='complete')
+                current_prompt = f"이전 담당자({current_agent})의 인계 문서입니다:\n\n{response}"
+                st.chat_message('assistant', avatar='🤝').caption(f"📢 {current_agent} ➔ {next_agent} 지시서:")
+                st.chat_message('assistant', avatar='🤝').text(current_prompt)
+                current_agent = next_agent
+            elif '[작업완료]' in response or current_agent == 'Writer':
+                status.update(label='🏆 교차 검증 파이프라인 완주!', state='complete')
+                current_agent = None
+        time.sleep(0.3)
+
+    st.subheader('📊 링기시 인프라 모니터링')
+    st.bar_chart(data=pd.DataFrame(performance_log), x='Agent', y='Time(s)', use_container_width=True)
+    
+    desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+    try: open(os.path.join(desktop_path, f"{project_name}.py"), 'w', encoding='utf-8').write(final_code_content) if final_code_content else None
+    except: pass
+    try: open(os.path.join(desktop_path, f"{project_name}_README.md"), 'w', encoding='utf-8').write(final_readme_content) if final_readme_content else None
+    except: pass
+    st.success(f"💾 로컬 빌드 마감 완료. 바탕화면의 {project_name}.py 및 README 문서를 확인하세요!")
